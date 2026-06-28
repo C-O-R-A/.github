@@ -1,7 +1,7 @@
 # CORA
 
 Collaborative Open Robotic Arms
-
+[read more](https://c-o-r-a.github.io/cora-documentation/pages/General/introduction.html)
 ![Joints.png](https://raw.githubusercontent.com/C-O-R-A/.github/main/assets/Joints.png)
 
 ## About
