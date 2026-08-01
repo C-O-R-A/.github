@@ -16,4 +16,4 @@ The platform aims to provide a standard robotic joint library so users can mix a
 - [cora_robot](https://github.com/C-O-R-A/cora_robot) hardware communication packages
 - [codi](https://github.com/C-O-R-A/codi) python sdk for commanding the robot
 
-[read the docs]([https://c-o-r-a.github.io/cora-documentation/pages/General/introduction.html](https://c-o-r-a.github.io/cora-documentation/))
+[read the docs](https://c-o-r-a.github.io/cora-documentation/)
