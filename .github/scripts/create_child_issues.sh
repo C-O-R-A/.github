@@ -1,7 +1,3 @@
-The file was pasted with my explanatory text into the `.sh` file. That's why Bash is trying to execute `Understood.` and `Issue` as commands.
-
-Replace the **entire file** with exactly the script below. Do not include anything before `#!/usr/bin/env bash` or after the final `Done.`.
-
 #!/usr/bin/env bash
 
 set -euo pipefail
