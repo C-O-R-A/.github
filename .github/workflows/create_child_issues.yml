@@ -3,7 +3,6 @@ name: Convert current-iteration checklists to child issues
 on:
   workflow_dispatch:
   schedule:
-    # Run every hour.
     - cron: "17 * * * *"
 
 permissions:
@@ -19,19 +18,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Process checklist items
+      - name: Convert checklist items
         env:
           GH_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Looking up C-O-R-A Project #2..."
+          echo "Looking up $ORGANIZATION Project #$PROJECT_NUMBER..."
 
-          # ---------------------------------------------------------------
-          # 1. Find the Project node ID, iteration field, and current
-          #    iteration.
-          # ---------------------------------------------------------------
+          # ================================================================
+          # Find the Project and its Iteration field
+          # ================================================================
 
           PROJECT_QUERY='
           query($org: String!, $number: Int!) {
@@ -76,7 +74,7 @@ jobs:
             jq -r '.data.organization.projectV2.title' <<< "$PROJECT_JSON"
           )"
 
-          if [[ "$PROJECT_ID" == "null" || -z "$PROJECT_ID" ]]; then
+          if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "null" ]]; then
             echo "::error::Could not find Project #$PROJECT_NUMBER."
             exit 1
           fi
@@ -93,15 +91,16 @@ jobs:
           )"
 
           if [[ -z "$ITERATION_FIELD_ID" || "$ITERATION_FIELD_ID" == "null" ]]; then
-            echo "::error::No Iteration field found in the Project."
+            echo "::error::No Iteration field found."
             exit 1
           fi
 
-          # ---------------------------------------------------------------
-          # 2. Determine which iteration is currently active.
-          # ---------------------------------------------------------------
+          # ================================================================
+          # Find current iteration
+          # ================================================================
 
           TODAY_EPOCH="$(date -u +%s)"
+
           CURRENT_ITERATION=""
 
           while IFS= read -r ITERATION; do
@@ -130,23 +129,72 @@ jobs:
             exit 1
           fi
 
-          ITERATION_ID="$(
-            jq -r '.id' <<< "$CURRENT_ITERATION"
-          )"
-
-          ITERATION_TITLE="$(
-            jq -r '.title' <<< "$CURRENT_ITERATION"
-          )"
+          ITERATION_ID="$(jq -r '.id' <<< "$CURRENT_ITERATION")"
+          ITERATION_TITLE="$(jq -r '.title' <<< "$CURRENT_ITERATION")"
 
           echo "Current iteration: $ITERATION_TITLE"
           echo "Iteration ID: $ITERATION_ID"
 
-          # ---------------------------------------------------------------
-          # 3. Fetch every item in the Project.
-          # ---------------------------------------------------------------
+          # ================================================================
+          # Fetch Project items
+          #
+          # IMPORTANT:
+          # The first request does NOT send `after`.
+          # Subsequent requests send a real cursor.
+          # ================================================================
 
-          ITEMS_QUERY='
-          query($project: ID!, $after: String) {
+          ITEMS_QUERY_FIRST='
+          query($project: ID!) {
+            node(id: $project) {
+              ... on ProjectV2 {
+                items(first: 100) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+
+                  nodes {
+                    id
+                    type
+
+                    content {
+                      __typename
+
+                      ... on Issue {
+                        id
+                        databaseId
+                        number
+                        title
+                        body
+                        repository {
+                          nameWithOwner
+                        }
+                      }
+                    }
+
+                    fieldValues(first: 100) {
+                      nodes {
+                        __typename
+
+                        ... on ProjectV2ItemFieldIterationValue {
+                          iterationId
+
+                          field {
+                            ... on ProjectV2IterationField {
+                              id
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          ITEMS_QUERY_NEXT='
+          query($project: ID!, $after: String!) {
             node(id: $project) {
               ... on ProjectV2 {
                 items(first: 100, after: $after) {
@@ -168,7 +216,6 @@ jobs:
                         number
                         title
                         body
-                        state
                         repository {
                           nameWithOwner
                         }
@@ -197,25 +244,42 @@ jobs:
           }'
 
           ALL_ITEMS='[]'
-          AFTER=""
 
-          while true; do
+          # First page
+          RESPONSE="$(
+            gh api graphql \
+              -f query="$ITEMS_QUERY_FIRST" \
+              -f project="$PROJECT_ID"
+          )"
 
-            if [[ -n "$AFTER" ]]; then
-              RESPONSE="$(
-                gh api graphql \
-                  -f query="$ITEMS_QUERY" \
-                  -f project="$PROJECT_ID" \
-                  -f after="$AFTER"
-              )"
-            else
-              RESPONSE="$(
-                gh api graphql \
-                  -f query="$ITEMS_QUERY" \
-                  -f project="$PROJECT_ID" \
-                  -f after=null
-              )"
-            fi
+          PAGE_ITEMS="$(
+            jq -c '.data.node.items.nodes' <<< "$RESPONSE"
+          )"
+
+          ALL_ITEMS="$(
+            jq -c --argjson page "$PAGE_ITEMS" \
+              '. + $page' <<< "$ALL_ITEMS"
+          )"
+
+          HAS_NEXT="$(
+            jq -r '.data.node.items.pageInfo.hasNextPage' <<< "$RESPONSE"
+          )"
+
+          AFTER="$(
+            jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE"
+          )"
+
+          # Subsequent pages
+          while [[ "$HAS_NEXT" == "true" ]]; do
+
+            echo "Fetching next Project page..."
+
+            RESPONSE="$(
+              gh api graphql \
+                -f query="$ITEMS_QUERY_NEXT" \
+                -f project="$PROJECT_ID" \
+                -f after="$AFTER"
+            )"
 
             PAGE_ITEMS="$(
               jq -c '.data.node.items.nodes' <<< "$RESPONSE"
@@ -230,18 +294,16 @@ jobs:
               jq -r '.data.node.items.pageInfo.hasNextPage' <<< "$RESPONSE"
             )"
 
-            if [[ "$HAS_NEXT" != "true" ]]; then
-              break
-            fi
-
             AFTER="$(
               jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE"
             )"
           done
 
-          # ---------------------------------------------------------------
-          # 4. Only process issues that are in the current iteration.
-          # ---------------------------------------------------------------
+          echo "Total Project items: $(jq 'length' <<< "$ALL_ITEMS")"
+
+          # ================================================================
+          # Select issues in current iteration
+          # ================================================================
 
           CURRENT_ITEMS="$(
             jq -c \
@@ -265,51 +327,27 @@ jobs:
 
           ISSUE_COUNT="$(jq 'length' <<< "$CURRENT_ITEMS")"
 
-          echo "Found $ISSUE_COUNT issue(s) in the current iteration."
+          echo "Issues in current iteration: $ISSUE_COUNT"
 
-          # ---------------------------------------------------------------
-          # 5. Process each parent issue.
-          # ---------------------------------------------------------------
+          # ================================================================
+          # Process each issue
+          # ================================================================
 
           while IFS= read -r ITEM; do
 
-            ISSUE_NUMBER="$(
-              jq -r '.content.number' <<< "$ITEM"
-            )"
-
-            ISSUE_TITLE="$(
-              jq -r '.content.title' <<< "$ITEM"
-            )"
-
-            ISSUE_BODY="$(
-              jq -r '.content.body // ""' <<< "$ITEM"
-            )"
-
-            ISSUE_REPO="$(
-              jq -r '.content.repository.nameWithOwner' <<< "$ITEM"
-            )"
-
-            ISSUE_DATABASE_ID="$(
-              jq -r '.content.databaseId' <<< "$ITEM"
-            )"
+            ISSUE_NUMBER="$(jq -r '.content.number' <<< "$ITEM")"
+            ISSUE_TITLE="$(jq -r '.content.title' <<< "$ITEM")"
+            ISSUE_BODY="$(jq -r '.content.body // ""' <<< "$ITEM")"
+            ISSUE_REPO="$(jq -r '.content.repository.nameWithOwner' <<< "$ITEM")"
 
             echo ""
-            echo "=================================================="
-            echo "Issue: $ISSUE_REPO#$ISSUE_NUMBER"
-            echo "Title: $ISSUE_TITLE"
-            echo "=================================================="
+            echo "--------------------------------------------------"
+            echo "$ISSUE_REPO#$ISSUE_NUMBER — $ISSUE_TITLE"
+            echo "--------------------------------------------------"
 
-            # -------------------------------------------------------------
-            # Find Markdown checklist items.
-            #
-            # Supported:
-            #
-            # - [ ] Something
-            # - [x] Something
-            # - [X] Something
-            # * [ ] Something
-            # + [ ] Something
-            # -------------------------------------------------------------
+            # --------------------------------------------------------------
+            # Find checklist items
+            # --------------------------------------------------------------
 
             CHECKLIST="$(
               printf '%s\n' "$ISSUE_BODY" |
@@ -322,12 +360,9 @@ jobs:
               continue
             fi
 
-            # -------------------------------------------------------------
-            # Get existing child issues.
-            #
-            # We use titles for idempotency: if a child with the same title
-            # already exists, don't create another one.
-            # -------------------------------------------------------------
+            # --------------------------------------------------------------
+            # Existing child issues
+            # --------------------------------------------------------------
 
             EXISTING_CHILDREN="$(
               gh api \
@@ -345,11 +380,15 @@ jobs:
                 sed -E \
                   's/^[[:space:]]*[-*+] \[[ xX]\][[:space:]]+//' \
                   <<< "$LINE"
-              )
+              )"
 
               TITLE="$(sed 's/[[:space:]]*$//' <<< "$TITLE")"
 
               [[ -z "$TITLE" ]] && continue
+
+              # ------------------------------------------------------------
+              # Don't duplicate existing children
+              # ------------------------------------------------------------
 
               if grep -Fxq "$TITLE" <<< "$EXISTING_CHILDREN"; then
                 echo "Already exists: $TITLE"
@@ -362,16 +401,16 @@ jobs:
                 COMPLETED=false
               fi
 
-              echo "Creating child issue: $TITLE"
+              # ------------------------------------------------------------
+              # Create issue
+              # ------------------------------------------------------------
 
-              CHILD_BODY=$(
-                cat <<EOF
-              Automatically created from a checklist item in #$ISSUE_NUMBER.
+              echo "Creating: $TITLE"
 
-              Parent issue: #$ISSUE_NUMBER
-              Source checklist item: $TITLE
-              EOF
-              )
+              CHILD_BODY="Automatically created from checklist item in #$ISSUE_NUMBER.
+
+Parent issue: #$ISSUE_NUMBER
+Source checklist item: $TITLE"
 
               CHILD_NUMBER="$(
                 gh issue create \
@@ -382,11 +421,7 @@ jobs:
                   --jq '.number'
               )"
 
-              echo "Created $ISSUE_REPO#$CHILD_NUMBER"
-
-              # -----------------------------------------------------------
-              # Get the new issue's REST database ID and node ID.
-              # -----------------------------------------------------------
+              echo "Created #$CHILD_NUMBER"
 
               CHILD_JSON="$(
                 gh api \
@@ -395,17 +430,12 @@ jobs:
                   "/repos/$ISSUE_REPO/issues/$CHILD_NUMBER"
               )"
 
-              CHILD_DATABASE_ID="$(
-                jq -r '.id' <<< "$CHILD_JSON"
-              )"
+              CHILD_DATABASE_ID="$(jq -r '.id' <<< "$CHILD_JSON")"
+              CHILD_NODE_ID="$(jq -r '.node_id' <<< "$CHILD_JSON")"
 
-              CHILD_NODE_ID="$(
-                jq -r '.node_id' <<< "$CHILD_JSON"
-              )"
-
-              # -----------------------------------------------------------
-              # Make it a child issue of the parent.
-              # -----------------------------------------------------------
+              # ------------------------------------------------------------
+              # Attach child to parent
+              # ------------------------------------------------------------
 
               gh api \
                 --method POST \
@@ -417,9 +447,9 @@ jobs:
 
               echo "Attached as child issue."
 
-              # -----------------------------------------------------------
-              # Add the child to the organization Project.
-              # -----------------------------------------------------------
+              # ------------------------------------------------------------
+              # Add child to Project
+              # ------------------------------------------------------------
 
               ADD_ITEM_MUTATION='
               mutation($project: ID!, $content: ID!) {
@@ -443,16 +473,14 @@ jobs:
               )"
 
               CHILD_PROJECT_ITEM_ID="$(
-                jq -r \
-                  '.data.addProjectV2ItemById.item.id' \
-                  <<< "$ADD_RESULT"
+                jq -r '.data.addProjectV2ItemById.item.id' <<< "$ADD_RESULT"
               )"
 
               echo "Added child to Project."
 
-              # -----------------------------------------------------------
-              # Put the child in the same/current iteration.
-              # -----------------------------------------------------------
+              # ------------------------------------------------------------
+              # Set child's iteration
+              # ------------------------------------------------------------
 
               UPDATE_ITERATION_MUTATION='
               mutation(
@@ -485,23 +513,27 @@ jobs:
                 -f iteration="$ITERATION_ID" \
                 >/dev/null
 
-              echo "Set iteration to: $ITERATION_TITLE"
+              echo "Set iteration: $ITERATION_TITLE"
 
-              # -----------------------------------------------------------
-              # Preserve checked state.
-              # -----------------------------------------------------------
+              # ------------------------------------------------------------
+              # If original checkbox was checked, close the child
+              # ------------------------------------------------------------
 
               if [[ "$COMPLETED" == "true" ]]; then
+
                 gh issue close \
                   "$CHILD_NUMBER" \
                   --repo "$ISSUE_REPO"
 
                 echo "Closed child because checklist item was checked."
+
               fi
 
-              # Avoid hammering the API on large checklists.
               sleep 1
 
             done <<< "$CHECKLIST"
 
           done < <(jq -c '.[]' <<< "$CURRENT_ITEMS")
+
+          echo ""
+          echo "Done."
