@@ -1,12 +1,21 @@
+Understood. The parent items are now **real GitHub issues**, and the child issue must be created in **the same repository as its parent**.
+
+Use this script. It only processes `Issue` project items in the current iteration and derives the child repository from each parent issue.
+
 #!/usr/bin/env bash
 
 set -euo pipefail
 
 : "${ORGANIZATION:?ORGANIZATION is required}"
 : "${PROJECT_NUMBER:?PROJECT_NUMBER is required}"
-: "${CHILD_ISSUE_REPOSITORY:?CHILD_ISSUE_REPOSITORY is required}"
 
 echo "Looking up $ORGANIZATION Project #$PROJECT_NUMBER..."
+
+# ================================================================
+
+# Find Project and Iteration field
+
+# ================================================================
 
 PROJECT_QUERY='
 query($org: String!, $number: Int!) {
@@ -17,21 +26,25 @@ title
 fields(first: 100) {
 nodes {
 __typename
-... on ProjectV2IterationField {
-id
-name
-configuration {
-iterations {
-id
-title
-startDate
-duration
+
+```
+      ... on ProjectV2IterationField {
+        id
+        name
+        configuration {
+          iterations {
+            id
+            title
+            startDate
+            duration
+          }
+        }
+      }
+    }
+  }
 }
-}
-}
-}
-}
-}
+```
+
 }
 }'
 
@@ -42,8 +55,13 @@ gh api graphql
 -F number="$PROJECT_NUMBER"
 )"
 
-PROJECT_ID="$(jq -r '.data.organization.projectV2.id' <<< "$PROJECT_JSON")"
-PROJECT_TITLE="$(jq -r '.data.organization.projectV2.title' <<< "$PROJECT_JSON")"
+PROJECT_ID="$(
+jq -r '.data.organization.projectV2.id' <<< "$PROJECT_JSON"
+)"
+
+PROJECT_TITLE="$(
+jq -r '.data.organization.projectV2.title' <<< "$PROJECT_JSON"
+)"
 
 if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "null" ]]; then
 echo "::error::Could not find Project #$PROJECT_NUMBER."
@@ -58,7 +76,8 @@ jq -r '
 .data.organization.projectV2.fields.nodes[]
 | select(.__typename == "ProjectV2IterationField")
 | .id
-' <<< "$PROJECT_JSON" | head -n1
+' <<< "$PROJECT_JSON" |
+head -n1
 )"
 
 if [[ -z "$ITERATION_FIELD_ID" || "$ITERATION_FIELD_ID" == "null" ]]; then
@@ -68,7 +87,11 @@ fi
 
 echo "Iteration field: $ITERATION_FIELD_ID"
 
+# ================================================================
+
 # Find current iteration
+
+# ================================================================
 
 TODAY_EPOCH="$(date -u +%s)"
 CURRENT_ITERATION=""
@@ -105,7 +128,11 @@ ITERATION_TITLE="$(jq -r '.title' <<< "$CURRENT_ITERATION")"
 echo "Current iteration: $ITERATION_TITLE"
 echo "Iteration ID: $ITERATION_ID"
 
-# Fetch Project items
+# ================================================================
+
+# Fetch all Project items
+
+# ================================================================
 
 ITEMS_QUERY='
 query($project: ID!, $after: String) {
@@ -116,29 +143,47 @@ pageInfo {
 hasNextPage
 endCursor
 }
-nodes {
-id
-type
-content {
-__typename
-... on DraftIssue {
-id
-title
-body
+
+```
+    nodes {
+      id
+      type
+
+      content {
+        __typename
+
+        ... on Issue {
+          id
+          databaseId
+          number
+          title
+          body
+          state
+          repository {
+            nameWithOwner
+            owner {
+              login
+            }
+            name
+          }
+        }
+      }
+
+      fieldValues(first: 100) {
+        nodes {
+          __typename
+
+          ... on ProjectV2ItemFieldIterationValue {
+            iterationId
+            title
+          }
+        }
+      }
+    }
+  }
 }
-}
-fieldValues(first: 100) {
-nodes {
-__typename
-... on ProjectV2ItemFieldIterationValue {
-iterationId
-title
-}
-}
-}
-}
-}
-}
+```
+
 }
 }'
 
@@ -146,6 +191,7 @@ ALL_ITEMS='[]'
 AFTER="null"
 
 while true; do
+
 if [[ "$AFTER" == "null" ]]; then
 RESPONSE="$(
 gh api graphql 
@@ -164,7 +210,10 @@ fi
 PAGE_ITEMS="$(jq -c '.data.node.items.nodes' <<< "$RESPONSE")"
 
 ALL_ITEMS="$(
-jq -c --argjson page "$PAGE_ITEMS" '. + $page' <<< "$ALL_ITEMS"
+jq -c 
+--argjson page "$PAGE_ITEMS" 
+'. + $page' 
+<<< "$ALL_ITEMS"
 )"
 
 HAS_NEXT="$(jq -r '.data.node.items.pageInfo.hasNextPage' <<< "$RESPONSE")"
@@ -173,18 +222,23 @@ AFTER="$(jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE")"
 [[ "$HAS_NEXT" != "true" ]] && break
 
 echo "Fetching next Project page..."
+
 done
 
 echo "Total Project items: $(jq 'length' <<< "$ALL_ITEMS")"
 
-# Find draft items in current iteration
+# ================================================================
+
+# Select real issues in current iteration
+
+# ================================================================
 
 CURRENT_ITEMS="$(
 jq -c 
 --arg iteration "$ITERATION_ID" '
 [
 .[]
-| select(.content.__typename == "DraftIssue")
+| select(.content.__typename == "Issue")
 | select(
 any(
 .fieldValues.nodes[];
@@ -196,68 +250,42 @@ and .iterationId == $iteration
 ' <<< "$ALL_ITEMS"
 )"
 
-ITEM_COUNT="$(jq 'length' <<< "$CURRENT_ITEMS")"
+ISSUE_COUNT="$(jq 'length' <<< "$CURRENT_ITEMS")"
 
-echo "Draft items in current iteration: $ITEM_COUNT"
+echo "Issues in current iteration: $ISSUE_COUNT"
 
-if [[ "$ITEM_COUNT" == "0" ]]; then
+if [[ "$ISSUE_COUNT" == "0" ]]; then
 echo "Nothing to process."
 exit 0
 fi
 
-# Mutations
+# ================================================================
 
-ADD_ITEM_MUTATION='
-mutation($project: ID!, $content: ID!) {
-addProjectV2ItemById(
-input: {
-projectId: $project
-contentId: $content
-}
-) {
-item {
-id
-}
-}
-}'
+# Process issues
 
-UPDATE_ITERATION_MUTATION='
-mutation(
-$project: ID!,
-$item: ID!,
-$field: ID!,
-$iteration: String!
-) {
-updateProjectV2ItemFieldValue(
-input: {
-projectId: $project
-itemId: $item
-fieldId: $field
-value: {
-iterationId: $iteration
-}
-}
-) {
-projectV2Item {
-id
-}
-}
-}'
-
-# Process draft items
+# ================================================================
 
 while IFS= read -r ITEM; do
 
-DRAFT_TITLE="$(jq -r '.content.title' <<< "$ITEM")"
-DRAFT_BODY="$(jq -r '.content.body // ""' <<< "$ITEM")"
+PARENT_NUMBER="$(jq -r '.content.number' <<< "$ITEM")"
+PARENT_TITLE="$(jq -r '.content.title' <<< "$ITEM")"
+PARENT_BODY="$(jq -r '.content.body // ""' <<< "$ITEM")"
+PARENT_REPO="$(jq -r '.content.repository.nameWithOwner' <<< "$ITEM")"
 
 echo ""
 echo "=================================================="
-echo "Draft item: $DRAFT_TITLE"
+echo "$PARENT_REPO#$PARENT_NUMBER"
+echo "$PARENT_TITLE"
 echo "=================================================="
 
+# --------------------------------------------------------------
+
+# Find checklist items
+
+# --------------------------------------------------------------
+
 CHECKLIST="$(
-printf '%s\n' "$DRAFT_BODY" |
+printf '%s\n' "$PARENT_BODY" |
 grep -E '^[[:space:]]*[-*+] \([ xX]\)[[:space:]]+.+$' ||
 true
 )"
@@ -269,6 +297,12 @@ fi
 
 echo "Checklist items found:"
 echo "$CHECKLIST"
+
+# --------------------------------------------------------------
+
+# Process checklist
+
+# --------------------------------------------------------------
 
 while IFS= read -r LINE; do
 
@@ -285,18 +319,22 @@ TITLE="$(sed 's/[[:space:]]*$//' <<< "$TITLE")"
 
 [[ -z "$TITLE" ]] && continue
 
-COMPLETED=false
 if grep -qE '\[[xX]\]' <<< "$LINE"; then
   COMPLETED=true
+else
+  COMPLETED=false
 fi
 
 echo ""
 echo "Checklist item: $TITLE"
 
+# ------------------------------------------------------------
 # Check for an existing issue with exactly this title
+# ------------------------------------------------------------
+
 EXISTING_NUMBER="$(
   gh issue list \
-    --repo "$CHILD_ISSUE_REPOSITORY" \
+    --repo "$PARENT_REPO" \
     --state all \
     --search "$TITLE in:title" \
     --limit 100 \
@@ -309,25 +347,30 @@ EXISTING_NUMBER="$(
 )"
 
 if [[ -n "$EXISTING_NUMBER" ]]; then
-  echo "Already exists: #$EXISTING_NUMBER"
+  echo "Already exists: $PARENT_REPO#$EXISTING_NUMBER"
   continue
 fi
 
-CHILD_BODY="Created automatically from a checklist item in the Planner Board.
+# ------------------------------------------------------------
+# Create child issue in SAME repository as parent
+# ------------------------------------------------------------
+
+CHILD_BODY="Created automatically from a checklist item in:
 ```
 
-Source draft item: $DRAFT_TITLE
+Parent issue: #$PARENT_NUMBER
+Parent title: $PARENT_TITLE
 
-Checklist item:
+Source checklist item:
 
 $LINE"
 
 ```
-echo "Creating issue..."
+echo "Creating child issue in $PARENT_REPO..."
 
 CHILD_URL="$(
   gh issue create \
-    --repo "$CHILD_ISSUE_REPOSITORY" \
+    --repo "$PARENT_REPO" \
     --title "$TITLE" \
     --body "$CHILD_BODY"
 )"
@@ -342,16 +385,70 @@ fi
 
 echo "Created: $CHILD_URL"
 
+# ------------------------------------------------------------
+# Get child issue node ID
+# ------------------------------------------------------------
+
 CHILD_JSON="$(
   gh api \
     --header 'Accept: application/vnd.github+json' \
     --header 'X-GitHub-Api-Version: 2026-03-10' \
-    "/repos/$CHILD_ISSUE_REPOSITORY/issues/$CHILD_NUMBER"
+    "/repos/$PARENT_REPO/issues/$CHILD_NUMBER"
 )"
 
 CHILD_NODE_ID="$(jq -r '.node_id' <<< "$CHILD_JSON")"
 
-# Add issue to Project
+# ------------------------------------------------------------
+# Attach child to parent
+# ------------------------------------------------------------
+
+PARENT_DATABASE_ID="$(
+  jq -r '.content.databaseId' <<< "$ITEM"
+)"
+
+ADD_SUB_ISSUE_MUTATION='
+mutation($parent: Int!, $child: Int!) {
+  addSubIssue(
+    input: {
+      issueId: $parent
+      subIssueId: $child
+    }
+  ) {
+    issue {
+      id
+    }
+    subIssue {
+      id
+    }
+  }
+}'
+
+gh api graphql \
+  -f query="$ADD_SUB_ISSUE_MUTATION" \
+  -F parent="$PARENT_DATABASE_ID" \
+  -F child="$(jq -r '.databaseId' <<< "$CHILD_JSON")" \
+  >/dev/null
+
+echo "Attached as child of #$PARENT_NUMBER."
+
+# ------------------------------------------------------------
+# Add child to Project
+# ------------------------------------------------------------
+
+ADD_ITEM_MUTATION='
+mutation($project: ID!, $content: ID!) {
+  addProjectV2ItemById(
+    input: {
+      projectId: $project
+      contentId: $content
+    }
+  ) {
+    item {
+      id
+    }
+  }
+}'
+
 ADD_RESULT="$(
   gh api graphql \
     -f query="$ADD_ITEM_MUTATION" \
@@ -365,13 +462,39 @@ CHILD_PROJECT_ITEM_ID="$(
 
 if [[ -z "$CHILD_PROJECT_ITEM_ID" ||
       "$CHILD_PROJECT_ITEM_ID" == "null" ]]; then
-  echo "::error::Failed to add #$CHILD_NUMBER to Project."
+  echo "::error::Failed to add child to Project."
   exit 1
 fi
 
-echo "Added #$CHILD_NUMBER to Planner Board."
+echo "Added child to Planner Board."
 
-# Set iteration
+# ------------------------------------------------------------
+# Set child's iteration
+# ------------------------------------------------------------
+
+UPDATE_ITERATION_MUTATION='
+mutation(
+  $project: ID!,
+  $item: ID!,
+  $field: ID!,
+  $iteration: String!
+) {
+  updateProjectV2ItemFieldValue(
+    input: {
+      projectId: $project
+      itemId: $item
+      fieldId: $field
+      value: {
+        iterationId: $iteration
+      }
+    }
+  ) {
+    projectV2Item {
+      id
+    }
+  }
+}'
+
 gh api graphql \
   -f query="$UPDATE_ITERATION_MUTATION" \
   -f project="$PROJECT_ID" \
@@ -382,13 +505,18 @@ gh api graphql \
 
 echo "Set iteration: $ITERATION_TITLE"
 
-# Close if checklist item was already checked
+# ------------------------------------------------------------
+# Close child if source checkbox is checked
+# ------------------------------------------------------------
+
 if [[ "$COMPLETED" == "true" ]]; then
+
   gh issue close \
     "$CHILD_NUMBER" \
-    --repo "$CHILD_ISSUE_REPOSITORY"
+    --repo "$PARENT_REPO"
 
-  echo "Closed #$CHILD_NUMBER because checklist item was checked."
+  echo "Closed child because checklist item was checked."
+
 fi
 
 sleep 1
@@ -399,6 +527,4 @@ done <<< "$CHECKLIST"
 done < <(jq -c '.[]' <<< "$CURRENT_ITEMS")
 
 echo ""
-echo "=================================================="
-echo "Finished."
-echo "=================================================="
+echo "Done."
