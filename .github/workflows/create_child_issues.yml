@@ -1,0 +1,468 @@
+name: Convert checklist items to sub-issues
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every hour. Change or remove this if you only want manual runs.
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # Set this to the node ID of the GitHub Project.
+  #
+  # You can get it with:
+  # gh project list --owner YOUR_ORG_OR_USER
+  #
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+
+jobs:
+  convert-checklists:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find current iteration and process issues
+        env:
+          GH_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+
+          if [[ -z "${PROJECT_ID:-}" ]]; then
+            echo "::error::Repository variable PROJECT_ID is not configured."
+            exit 1
+          fi
+
+          echo "Repository: $OWNER/$REPO"
+          echo "Project: $PROJECT_ID"
+
+          # ------------------------------------------------------------------
+          # Find the project's Iteration field and determine the current
+          # iteration based on its start date + duration.
+          # ------------------------------------------------------------------
+
+          query='
+          query($id: ID!) {
+            node(id: $id) {
+              ... on ProjectV2 {
+                fields(first: 100) {
+                  nodes {
+                    __typename
+                    ... on ProjectV2IterationField {
+                      id
+                      name
+                      configuration {
+                        iterations {
+                          id
+                          title
+                          startDate
+                          duration
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          '
+
+          PROJECT_JSON="$(
+            gh api graphql \
+              -f query="$query" \
+              -F id="$PROJECT_ID"
+          )"
+
+          ITERATION_FIELD_ID="$(
+            jq -r '
+              .data.node.fields.nodes[]
+              | select(.__typename == "ProjectV2IterationField")
+              | .id
+            ' <<< "$PROJECT_JSON" | head -n1
+          )"
+
+          if [[ -z "$ITERATION_FIELD_ID" || "$ITERATION_FIELD_ID" == "null" ]]; then
+            echo "::error::No iteration field found in project."
+            exit 1
+          fi
+
+          TODAY="$(date -u +%F)"
+
+          CURRENT_ITERATION="$(
+            jq -c --arg today "$TODAY" '
+              .data.node.fields.nodes[]
+              | select(.__typename == "ProjectV2IterationField")
+              | .configuration.iterations[]
+              | select(
+                  .startDate <= $today
+                  and
+                  (($today | fromdateiso8601) <
+                    ((.startDate | fromdateiso8601) + (.duration * 86400)))
+                )
+            ' <<< "$PROJECT_JSON" | head -n1
+          )"
+
+          if [[ -z "$CURRENT_ITERATION" ]]; then
+            echo "::error::Could not determine the current iteration."
+            exit 1
+          fi
+
+          ITERATION_ID="$(jq -r '.id' <<< "$CURRENT_ITERATION")"
+          ITERATION_TITLE="$(jq -r '.title' <<< "$CURRENT_ITERATION")"
+
+          echo "Current iteration: $ITERATION_TITLE"
+          echo "Iteration ID: $ITERATION_ID"
+
+          # ------------------------------------------------------------------
+          # Fetch all project items.
+          # ------------------------------------------------------------------
+
+          items_query='
+          query($id: ID!, $after: String) {
+            node(id: $id) {
+              ... on ProjectV2 {
+                items(first: 100, after: $after) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    id
+                    type
+                    content {
+                      __typename
+                      ... on Issue {
+                        id
+                        number
+                        title
+                        body
+                        repository {
+                          nameWithOwner
+                        }
+                      }
+                    }
+                    fieldValues(first: 100) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2ItemFieldIterationValue {
+                          field {
+                            ... on ProjectV2IterationField {
+                              id
+                            }
+                          }
+                          iterationId
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          '
+
+          ITEMS='[]'
+          AFTER=""
+
+          while true; do
+            if [[ -n "$AFTER" ]]; then
+              RESPONSE="$(
+                gh api graphql \
+                  -f query="$items_query" \
+                  -F id="$PROJECT_ID" \
+                  -F after="$AFTER"
+              )"
+            else
+              RESPONSE="$(
+                gh api graphql \
+                  -f query="$items_query" \
+                  -F id="$PROJECT_ID" \
+                  -f after=null
+              )"
+            fi
+
+            PAGE_ITEMS="$(
+              jq -c '.data.node.items.nodes' <<< "$RESPONSE"
+            )"
+
+            ITEMS="$(
+              jq -c --argjson page "$PAGE_ITEMS" \
+                '. + $page' <<< "$ITEMS"
+            )"
+
+            HAS_NEXT="$(
+              jq -r '.data.node.items.pageInfo.hasNextPage' <<< "$RESPONSE"
+            )"
+
+            if [[ "$HAS_NEXT" != "true" ]]; then
+              break
+            fi
+
+            AFTER="$(
+              jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE"
+            )"
+          done
+
+          # ------------------------------------------------------------------
+          # Keep only Issue items belonging to the current iteration.
+          # ------------------------------------------------------------------
+
+          CURRENT_ITEMS="$(
+            jq -c \
+              --arg field "$ITERATION_FIELD_ID" \
+              --arg iteration "$ITERATION_ID" '
+              [
+                .[]
+                | select(.type == "ISSUE")
+                | select(.content.__typename == "Issue")
+                | select(
+                    any(
+                      .fieldValues.nodes[];
+                      .__typename == "ProjectV2ItemFieldIterationValue"
+                      and
+                      .field.id == $field
+                      and
+                      .iterationId == $iteration
+                    )
+                  )
+              ]
+            ' <<< "$ITEMS"
+          )"
+
+          COUNT="$(
+            jq 'length' <<< "$CURRENT_ITEMS"
+          )"
+
+          echo "Found $COUNT issue(s) in the current iteration."
+
+          # ------------------------------------------------------------------
+          # Process each parent issue.
+          # ------------------------------------------------------------------
+
+          jq -c '.[]' <<< "$CURRENT_ITEMS" |
+          while read -r ITEM; do
+            ISSUE_NUMBER="$(
+              jq -r '.content.number' <<< "$ITEM"
+            )"
+
+            ISSUE_TITLE="$(
+              jq -r '.content.title' <<< "$ITEM"
+            )"
+
+            ISSUE_BODY="$(
+              jq -r '.content.body // ""' <<< "$ITEM"
+            )"
+
+            ISSUE_ID="$(
+              jq -r '.content.id' <<< "$ITEM"
+            )"
+
+            ISSUE_REPO="$(
+              jq -r '.content.repository.nameWithOwner' <<< "$ITEM"
+            )"
+
+            echo ""
+            echo "=================================================="
+            echo "Parent: $ISSUE_REPO#$ISSUE_NUMBER — $ISSUE_TITLE"
+            echo "=================================================="
+
+            # ----------------------------------------------------------------
+            # Extract Markdown checklist items.
+            #
+            # Supported:
+            #   - [ ] Do something
+            #   - [x] Do something
+            #   * [ ] Do something
+            #   * [X] Do something
+            #
+            # Lines nested under a checklist item are intentionally ignored.
+            # ----------------------------------------------------------------
+
+            CHECKLIST="$(
+              printf '%s\n' "$ISSUE_BODY" |
+              grep -E '^[[:space:]]*[-*+] \[[ xX]\][[:space:]]+.+$' || true
+            )"
+
+            if [[ -z "$CHECKLIST" ]]; then
+              echo "No checklist items."
+              continue
+            fi
+
+            # ----------------------------------------------------------------
+            # Get existing sub-issues so the workflow is idempotent.
+            # ----------------------------------------------------------------
+
+            EXISTING_SUBISSUES="$(
+              gh api \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                "/repos/$ISSUE_REPO/issues/$ISSUE_NUMBER/sub_issues?per_page=100" |
+              jq -r '.[].title'
+            )"
+
+            # ----------------------------------------------------------------
+            # Convert each checklist item into a child issue.
+            # ----------------------------------------------------------------
+
+            while IFS= read -r LINE; do
+              [[ -z "$LINE" ]] && continue
+
+              if [[ "$LINE" =~ \[[xX]\] ]]; then
+                COMPLETED=true
+              else
+                COMPLETED=false
+              fi
+
+              TITLE="$(
+                sed -E \
+                  's/^[[:space:]]*[-*+] \[[ xX]\][[:space:]]+//' \
+                  <<< "$LINE"
+              )"
+
+              # Strip optional Markdown link formatting from the beginning
+              # only for duplicate detection, while retaining the actual
+              # title in the created issue.
+              TITLE="$(printf '%s' "$TITLE" | sed 's/[[:space:]]*$//')"
+
+              if [[ -z "$TITLE" ]]; then
+                continue
+              fi
+
+              # Exact title match against an existing child issue.
+              if grep -Fxq "$TITLE" <<< "$EXISTING_SUBISSUES"; then
+                echo "Already exists: $TITLE"
+                continue
+              fi
+
+              echo "Creating child issue: $TITLE"
+
+              CHILD_BODY=$(
+                cat <<EOF
+              Created automatically from checklist item in #$ISSUE_NUMBER.
+
+              Parent: #$ISSUE_NUMBER
+              Source checklist item: $TITLE
+              EOF
+              )
+
+              CHILD_NUMBER="$(
+                gh issue create \
+                  --repo "$ISSUE_REPO" \
+                  --title "$TITLE" \
+                  --body "$CHILD_BODY" \
+                  --json number \
+                  --jq '.number'
+              )"
+
+              echo "Created #$CHILD_NUMBER"
+
+              # --------------------------------------------------------------
+              # Attach the newly created issue as a sub-issue.
+              # --------------------------------------------------------------
+
+              CHILD_ID="$(
+                gh api \
+                  "/repos/$ISSUE_REPO/issues/$CHILD_NUMBER" |
+                jq -r '.id'
+              )"
+
+              gh api \
+                --method POST \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                "/repos/$ISSUE_REPO/issues/$ISSUE_NUMBER/sub_issues" \
+                -f sub_issue_id="$CHILD_ID" >/dev/null
+
+              echo "Attached #$CHILD_NUMBER as a sub-issue."
+
+              # --------------------------------------------------------------
+              # Put the child issue into the same Project.
+              # --------------------------------------------------------------
+
+              ADD_ITEM_MUTATION='
+              mutation($project: ID!, $content: ID!) {
+                addProjectV2ItemById(
+                  input: {
+                    projectId: $project
+                    contentId: $content
+                  }
+                ) {
+                  item {
+                    id
+                  }
+                }
+              }
+              '
+
+              ADD_RESULT="$(
+                gh api graphql \
+                  -f query="$ADD_ITEM_MUTATION" \
+                  -F project="$PROJECT_ID" \
+                  -F content="$(
+                    gh api "/repos/$ISSUE_REPO/issues/$CHILD_NUMBER" |
+                    jq -r '.node_id'
+                  )"
+              )"
+
+              CHILD_ITEM_ID="$(
+                jq -r '.data.addProjectV2ItemById.item.id' <<< "$ADD_RESULT"
+              )"
+
+              # --------------------------------------------------------------
+              # Set the child's iteration to the current iteration.
+              # --------------------------------------------------------------
+
+              UPDATE_ITERATION_MUTATION='
+              mutation(
+                $project: ID!,
+                $item: ID!,
+                $field: ID!,
+                $iteration: String!
+              ) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $project
+                    itemId: $item
+                    fieldId: $field
+                    value: {
+                      iterationId: $iteration
+                    }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+              '
+
+              gh api graphql \
+                -f query="$UPDATE_ITERATION_MUTATION" \
+                -F project="$PROJECT_ID" \
+                -F item="$CHILD_ITEM_ID" \
+                -F field="$ITERATION_FIELD_ID" \
+                -F iteration="$ITERATION_ID" >/dev/null
+
+              echo "Added #$CHILD_NUMBER to iteration '$ITERATION_TITLE'."
+
+              # --------------------------------------------------------------
+              # Preserve completed checklist state.
+              # --------------------------------------------------------------
+
+              if [[ "$COMPLETED" == "true" ]]; then
+                gh issue close "$CHILD_NUMBER" --repo "$ISSUE_REPO"
+                echo "Closed #$CHILD_NUMBER because its checklist item was checked."
+              fi
+
+              # Avoid secondary-rate-limit problems when processing a large
+              # number of checklist items.
+              sleep 1
+
+            done <<< "$CHECKLIST"
+
+          done
