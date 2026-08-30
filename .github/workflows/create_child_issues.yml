@@ -1,5 +1,5 @@
 name: Convert current-iteration checklists to child issues
-
+ 
 on:
   workflow_dispatch:
   schedule:
