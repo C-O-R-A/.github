@@ -72,6 +72,8 @@ if [[ -z "$ITERATION_FIELD_ID" || "$ITERATION_FIELD_ID" == "null" ]]; then
   exit 1
 fi
 
+echo "Iteration field: $ITERATION_FIELD_ID"
+
 # ================================================================
 # Find current iteration
 # ================================================================
@@ -112,7 +114,7 @@ echo "Current iteration: $ITERATION_TITLE"
 echo "Iteration ID: $ITERATION_ID"
 
 # ================================================================
-# GraphQL queries for Project items
+# Fetch Project items
 # ================================================================
 
 ITEMS_QUERY_FIRST='
@@ -150,12 +152,7 @@ query($project: ID!) {
 
               ... on ProjectV2ItemFieldIterationValue {
                 iterationId
-
-                field {
-                  ... on ProjectV2IterationField {
-                    id
-                  }
-                }
+                title
               }
             }
           }
@@ -200,12 +197,7 @@ query($project: ID!, $after: String!) {
 
               ... on ProjectV2ItemFieldIterationValue {
                 iterationId
-
-                field {
-                  ... on ProjectV2IterationField {
-                    id
-                  }
-                }
+                title
               }
             }
           }
@@ -215,12 +207,9 @@ query($project: ID!, $after: String!) {
   }
 }'
 
-# ================================================================
-# Get all Project items
-# ================================================================
-
 ALL_ITEMS='[]'
 
+# First page
 RESPONSE="$(
   gh api graphql \
     -f query="$ITEMS_QUERY_FIRST" \
@@ -243,7 +232,9 @@ AFTER="$(
   jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE"
 )"
 
+# Additional pages
 while [[ "$HAS_NEXT" == "true" ]]; do
+
   echo "Fetching next Project page..."
 
   RESPONSE="$(
@@ -268,6 +259,7 @@ while [[ "$HAS_NEXT" == "true" ]]; do
   AFTER="$(
     jq -r '.data.node.items.pageInfo.endCursor' <<< "$RESPONSE"
   )"
+
 done
 
 echo "Total Project items: $(jq 'length' <<< "$ALL_ITEMS")"
@@ -278,7 +270,6 @@ echo "Total Project items: $(jq 'length' <<< "$ALL_ITEMS")"
 
 CURRENT_ITEMS="$(
   jq -c \
-    --arg field "$ITERATION_FIELD_ID" \
     --arg iteration "$ITERATION_ID" '
     [
       .[]
@@ -288,7 +279,6 @@ CURRENT_ITEMS="$(
           any(
             .fieldValues.nodes[];
             .__typename == "ProjectV2ItemFieldIterationValue"
-            and .field.id == $field
             and .iterationId == $iteration
           )
         )
@@ -313,7 +303,8 @@ while IFS= read -r ITEM; do
 
   echo ""
   echo "=================================================="
-  echo "$ISSUE_REPO#$ISSUE_NUMBER — $ISSUE_TITLE"
+  echo "$ISSUE_REPO#$ISSUE_NUMBER"
+  echo "$ISSUE_TITLE"
   echo "=================================================="
 
   # --------------------------------------------------------------
@@ -335,7 +326,7 @@ while IFS= read -r ITEM; do
   echo "$CHECKLIST"
 
   # --------------------------------------------------------------
-  # Get existing child issues
+  # Existing child issues
   # --------------------------------------------------------------
 
   EXISTING_CHILDREN="$(
@@ -347,7 +338,7 @@ while IFS= read -r ITEM; do
   )"
 
   # --------------------------------------------------------------
-  # Process each checklist item
+  # Create child issue for each checklist item
   # --------------------------------------------------------------
 
   while IFS= read -r LINE; do
@@ -364,28 +355,17 @@ while IFS= read -r ITEM; do
 
     [[ -z "$TITLE" ]] && continue
 
-    # ------------------------------------------------------------
-    # Don't create duplicates
-    # ------------------------------------------------------------
-
+    # Avoid duplicates
     if grep -Fxq "$TITLE" <<< "$EXISTING_CHILDREN"; then
       echo "Already exists: $TITLE"
       continue
     fi
-
-    # ------------------------------------------------------------
-    # Determine whether checklist item is checked
-    # ------------------------------------------------------------
 
     if grep -qE '\[[xX]\]' <<< "$LINE"; then
       COMPLETED=true
     else
       COMPLETED=false
     fi
-
-    # ------------------------------------------------------------
-    # Create child issue
-    # ------------------------------------------------------------
 
     echo "Creating child issue: $TITLE"
 
@@ -405,10 +385,6 @@ Source checklist item: $TITLE"
 
     echo "Created $ISSUE_REPO#$CHILD_NUMBER"
 
-    # ------------------------------------------------------------
-    # Get new issue details
-    # ------------------------------------------------------------
-
     CHILD_JSON="$(
       gh api \
         --header 'Accept: application/vnd.github+json' \
@@ -420,7 +396,7 @@ Source checklist item: $TITLE"
     CHILD_NODE_ID="$(jq -r '.node_id' <<< "$CHILD_JSON")"
 
     # ------------------------------------------------------------
-    # Make it a child issue
+    # Attach child issue to parent
     # ------------------------------------------------------------
 
     gh api \
@@ -465,7 +441,7 @@ Source checklist item: $TITLE"
     echo "Added child to Project."
 
     # ------------------------------------------------------------
-    # Set child's iteration
+    # Set child iteration
     # ------------------------------------------------------------
 
     UPDATE_ITERATION_MUTATION='
