@@ -1,9 +1,6 @@
 name: Create child issues from checklists
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "17 * * * *"
+on: workflow_run
 
 jobs:
   create-child-issues:
