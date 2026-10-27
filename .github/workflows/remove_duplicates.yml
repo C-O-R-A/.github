@@ -1,0 +1,79 @@
+name: Remove duplicate issues
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  dedupe-issues:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close issues that are duplicates of the oldest issue for the same title
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+              sort: 'created',
+              direction: 'asc'
+            });
+
+            const byTitle = new Map();
+
+            for (const issue of issues) {
+              // Skip pull requests
+              if (issue.pull_request) continue;
+
+              const title = issue.title.trim();
+              if (!title) continue;
+
+              if (!byTitle.has(title)) {
+                byTitle.set(title, []);
+              }
+              byTitle.get(title).push(issue);
+            }
+
+            for (const [title, items] of byTitle.entries()) {
+              if (items.length < 2) continue;
+
+              // Keep the oldest issue for this title.
+              items.sort((a, b) => {
+                const aDate = new Date(a.created_at).getTime();
+                const bDate = new Date(b.created_at).getTime();
+                return aDate - bDate || a.number - b.number;
+              });
+
+              const oldest = items[0];
+
+              for (const issue of items.slice(1)) {
+                // Only close duplicates that are younger than the oldest issue.
+                const isYounger = new Date(issue.created_at) > new Date(oldest.created_at);
+
+                if (!isYounger) continue;
+
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: `Closing as duplicate of #${oldest.number} because this issue has the same title and was created after the oldest record for this title.`
+                });
+
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+
+                core.info(`Closed duplicate issue #${issue.number} for title: "${title}"`);
+              }
+            }
