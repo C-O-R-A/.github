@@ -2,6 +2,16 @@ name: Remove duplicate issues
 
 on:
   workflow_dispatch:
+    inputs:
+      org:
+        description: 'Organization to scan for duplicate issues'
+        required: false
+        default: 'C-O-R-A'
+      include_archived:
+        description: 'Include archived repositories'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   issues: write
@@ -10,70 +20,94 @@ jobs:
   dedupe-issues:
     runs-on: ubuntu-latest
     steps:
-      - name: Close issues that are duplicates of the oldest issue for the same title
+      - name: Close duplicate issues across all repos in the org
         uses: actions/github-script@v7
+        env:
+          ORG: ${{ github.event.inputs.org || 'C-O-R-A' }}
+          INCLUDE_ARCHIVED: ${{ github.event.inputs.include_archived || 'false' }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.REPO_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const org = process.env.ORG || 'C-O-R-A';
+            const includeArchived = process.env.INCLUDE_ARCHIVED === 'true';
 
-            const issues = await github.paginate(github.rest.issues.listForRepo, {
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100,
-              sort: 'created',
-              direction: 'asc'
-            });
+            const repos = [];
 
-            const byTitle = new Map();
-
-            for (const issue of issues) {
-              // Skip pull requests
-              if (issue.pull_request) continue;
-
-              const title = issue.title.trim();
-              if (!title) continue;
-
-              if (!byTitle.has(title)) {
-                byTitle.set(title, []);
+            for await (const response of github.paginate.iterator(github.rest.repos.listForOrg, {
+              org,
+              type: 'all',
+              per_page: 100
+            })) {
+              for (const repo of response.data) {
+                if (!includeArchived && repo.archived) continue;
+                repos.push(repo);
               }
-              byTitle.get(title).push(issue);
             }
 
-            for (const [title, items] of byTitle.entries()) {
-              if (items.length < 2) continue;
+            core.info(`Scanning ${repos.length} repositories in ${org}`);
 
-              // Keep the oldest issue for this title.
-              items.sort((a, b) => {
-                const aDate = new Date(a.created_at).getTime();
-                const bDate = new Date(b.created_at).getTime();
-                return aDate - bDate || a.number - b.number;
-              });
+            for (const repo of repos) {
+              const owner = org;
+              const repoName = repo.name;
 
-              const oldest = items[0];
-
-              for (const issue of items.slice(1)) {
-                // Only close duplicates that are younger than the oldest issue.
-                const isYounger = new Date(issue.created_at) > new Date(oldest.created_at);
-
-                if (!isYounger) continue;
-
-                await github.rest.issues.createComment({
+              try {
+                const issues = await github.paginate(github.rest.issues.listForRepo, {
                   owner,
-                  repo,
-                  issue_number: issue.number,
-                  body: `Closing as duplicate of #${oldest.number} because this issue has the same title and was created after the oldest record for this title.`
+                  repo: repoName,
+                  state: 'open',
+                  per_page: 100,
+                  sort: 'created',
+                  direction: 'asc'
                 });
 
-                await github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number: issue.number,
-                  state: 'closed'
-                });
+                const byTitle = new Map();
 
-                core.info(`Closed duplicate issue #${issue.number} for title: "${title}"`);
+                for (const issue of issues) {
+                  if (issue.pull_request) continue;
+
+                  const title = issue.title?.trim();
+                  if (!title) continue;
+
+                  if (!byTitle.has(title)) {
+                    byTitle.set(title, []);
+                  }
+                  byTitle.get(title).push(issue);
+                }
+
+                for (const [title, items] of byTitle.entries()) {
+                  if (items.length < 2) continue;
+
+                  items.sort((a, b) => {
+                    const aDate = new Date(a.created_at).getTime();
+                    const bDate = new Date(b.created_at).getTime();
+                    return aDate - bDate || a.number - b.number;
+                  });
+
+                  const oldest = items[0];
+
+                  for (const issue of items.slice(1)) {
+                    const isYounger = new Date(issue.created_at).getTime() > new Date(oldest.created_at).getTime();
+
+                    if (!isYounger) continue;
+
+                    await github.rest.issues.createComment({
+                      owner,
+                      repo: repoName,
+                      issue_number: issue.number,
+                      body: `Closing as duplicate of #${oldest.number} because this issue has the same title and was created after the oldest record for this title.`
+                    });
+
+                    await github.rest.issues.update({
+                      owner,
+                      repo: repoName,
+                      issue_number: issue.number,
+                      state: 'closed'
+                    });
+
+                    core.info(`Closed duplicate issue #${issue.number} in ${owner}/${repoName} for title: "${title}"`);
+                  }
+                }
+              } catch (error) {
+                core.warning(`Failed to process ${owner}/${repoName}: ${error.message}`);
               }
             }
