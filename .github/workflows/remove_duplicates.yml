@@ -2,7 +2,7 @@ name: Remove duplicate issues
 
 on:
   schedule:
-    - cron: 0 * * * *  
+    - cron: 0 * * * *
   workflow_dispatch:
     inputs:
       org:
@@ -22,7 +22,7 @@ jobs:
   dedupe-issues:
     runs-on: ubuntu-latest
     steps:
-      - name: Close duplicate issues across all repos in the org
+      - name: Close or delete duplicate issues across all repos in the org
         uses: actions/github-script@v7
         env:
           ORG: ${{ github.event.inputs.org || 'C-O-R-A' }}
@@ -56,7 +56,7 @@ jobs:
                 const issues = await github.paginate(github.rest.issues.listForRepo, {
                   owner,
                   repo: repoName,
-                  state: 'open',
+                  state: 'all',
                   per_page: 100,
                   sort: 'created',
                   direction: 'asc'
@@ -89,8 +89,23 @@ jobs:
 
                   for (const issue of items.slice(1)) {
                     const isYounger = new Date(issue.created_at).getTime() > new Date(oldest.created_at).getTime();
-
                     if (!isYounger) continue;
+
+                    if (issue.state === 'closed') {
+                      await github.graphql(
+                        `
+                        mutation DeleteIssue($issueId: ID!) {
+                          deleteIssue(input: { issueId: $issueId }) {
+                            clientMutationId
+                          }
+                        }
+                        `,
+                        { issueId: issue.node_id }
+                      );
+
+                      core.info(`Deleted closed duplicate issue #${issue.number} in ${owner}/${repoName} for title: "${title}"`);
+                      continue;
+                    }
 
                     await github.rest.issues.createComment({
                       owner,
